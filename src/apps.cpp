@@ -5,15 +5,23 @@
 #include <new>
 #include <stdexcept>
 #include "interp.h"
-#include "os.h"
+#include <atomic>
+#include <cstring>
+#include <mutex>
+#include "app_api.h"
 
 #define C565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
-static int g_consoleMode = 0;   // 0 = HRScript, 1 = kernel shell
 
 // ================= HRScript host (shared by Console app and `run` in kernel shell) =================
 struct Line { std::string s; uint16_t col; };
+static std::recursive_mutex g_mx;
+struct Hist { uint32_t id, t, ms; bool ok; std::string src, out; };
+static std::vector<Hist> g_hist; static uint32_t g_histId = 0;
+static const uint16_t kThemes[] = {rgb(0, 255, 70), rgb(0, 220, 255), rgb(255, 176, 0), rgb(255, 80, 220), rgb(235, 235, 235)};
+static int g_themeIdx = 0;
 static std::vector<Line> g_out;
 static void emit(const std::string& s, uint16_t col = TFT_WHITE) {
+  std::lock_guard<std::recursive_mutex> lk(g_mx);
   size_t st = 0;
   while (st <= s.size()) {
     size_t e = s.find('\n', st); if (e == std::string::npos) e = s.size();
@@ -29,7 +37,7 @@ struct ScriptHost {
     I.out = [](const std::string& s) { emit(s); };
     auto need = [](V& a, size_t n, const char* sig) { if (a.size() != n) throw std::invalid_argument(std::string("expected ") + sig); };
     auto num = [](V& a, size_t i) -> double { if (a[i].t != Value::NUM) throw std::invalid_argument("argument " + std::to_string(i + 1) + " must be a number"); return a[i].n; };
-    auto canvas = [this]() -> M5Canvas& { if (!scr) throw std::runtime_error("no script canvas - open the Console app (script mode)"); return *scr; };
+    auto canvas = [this]() -> M5Canvas& { if (!scr || !sys::canvasValid(scr)) { scr = nullptr; throw std::runtime_error("no script canvas - open the Console app (script mode)"); } return *scr; };
     auto bounds = [this, canvas](const char* fn, int x, int y, int w, int h) {
       M5Canvas& c = canvas();
       if (x < 0 || y < 0 || w < 0 || h < 0 || x + w > c.width() || y + h > c.height())
@@ -42,11 +50,11 @@ struct ScriptHost {
     I.bind("rect", [=](V& a) { need(a, 5, "rect(x,y,w,h,color)"); int x = num(a, 0), y = num(a, 1), w = num(a, 2), h = num(a, 3); bounds("rect", x, y, w, h); canvas().fillRect(x, y, w, h, (uint16_t)num(a, 4)); return Value(); });
     I.bind("circle", [=](V& a) { need(a, 4, "circle(x,y,r,color)"); int x = num(a, 0), y = num(a, 1), r = num(a, 2); bounds("circle", x - r, y - r, 2 * r, 2 * r); canvas().fillCircle(x, y, r, (uint16_t)num(a, 3)); return Value(); });
     I.bind("line", [=](V& a) { need(a, 5, "line(x1,y1,x2,y2,color)"); int x1 = num(a, 0), y1 = num(a, 1), x2 = num(a, 2), y2 = num(a, 3); bounds("line", std::min(x1, x2), std::min(y1, y2), abs(x2 - x1), abs(y2 - y1)); canvas().drawLine(x1, y1, x2, y2, (uint16_t)num(a, 4)); return Value(); });
-    I.bind("text", [=](V& a) { need(a, 5, "text(x,y,str,size,color)"); int x = num(a, 0), y = num(a, 1); bounds("text", x, y, 0, 0); M5Canvas& c = canvas(); c.setFont(&fonts::FreeSans12pt7b); c.setTextSize(num(a, 3)); c.setTextColor((uint16_t)num(a, 4)); c.setTextDatum(top_left); c.drawString(a[2].toString().c_str(), x, y); return Value(); });
+    I.bind("text", [=](V& a) { need(a, 5, "text(x,y,str,size,color)"); int x = num(a, 0), y = num(a, 1); bounds("text", x, y, 0, 0); M5Canvas& c = canvas(); uiFont(&c, &fonts::FreeSans12pt7b); uiSize(&c, num(a, 3)); c.setTextColor((uint16_t)num(a, 4)); c.setTextDatum(top_left); c.drawString(a[2].toString().c_str(), x, y); return Value(); });
     I.bind("width", [=](V&) { return Value::num(canvas().width()); });
     I.bind("height", [=](V&) { return Value::num(canvas().height()); });
     I.bind("millis", [](V&) { return Value::num(millis()); });
-    I.bind("delay", [=](V& a) { need(a, 1, "delay(ms)"); double ms = num(a, 0); if (ms < 0 || ms > 2000) throw std::out_of_range("delay() must be 0..2000 ms"); delay((uint32_t)ms); return Value(); });
+    I.bind("delay", [=](V& a) { need(a, 1, "delay(ms)"); double ms = num(a, 0); if (ms < 0 || ms > 2000) throw std::out_of_range("delay() must be 0..2000 ms"); for (double t = 0; t < ms; t += 100) { delay((uint32_t)std::min(100.0, ms - t)); sys::pet(); } return Value(); });
     I.bind("rand", [=](V& a) { need(a, 1, "rand(n)"); double n = num(a, 0); if (n < 1) throw std::runtime_error("rand(n) needs n >= 1"); return Value::num(esp_random() % (uint32_t)n); });
     I.bind("str", [](V& a) { return Value::str(a.empty() ? "" : a[0].toString()); });
     I.bind("num", [](V& a) { if (a.size() != 1) throw std::invalid_argument("expected num(x)"); return Value::num(atof(a[0].toString().c_str())); });
@@ -56,19 +64,27 @@ struct ScriptHost {
     I.bind("cos", [=](V& a) { need(a, 1, "cos(x)"); return Value::num(cos(num(a, 0))); });
     I.bind("abs", [=](V& a) { need(a, 1, "abs(x)"); return Value::num(fabs(num(a, 0))); });
     I.bind("floor", [=](V& a) { need(a, 1, "floor(x)"); return Value::num(floor(num(a, 0))); });
-    I.bind("heap", [](V&) { return Value::num(ESP.getFreeHeap()); });
-    I.bind("psram", [](V&) { return Value::num(ESP.getFreePsram()); });
-    I.bind("brightness", [=](V& a) { need(a, 1, "brightness(0..255)"); double b = num(a, 0); if (b < 0 || b > 255) throw std::out_of_range("brightness must be 0..255"); M5.Display.setBrightness((uint8_t)b); return Value(); });
+    I.bind("heap", [](V&) { return Value::num(sys::freeHeap()); });
+    I.bind("psram", [](V&) { return Value::num(sys::freePsram()); });
+    I.bind("brightness", [=](V& a) { need(a, 1, "brightness(0..255)"); double b = num(a, 0); if (b < 0 || b > 255) throw std::out_of_range("brightness must be 0..255"); sys::setBrightness((int)b); return Value(); });
   }
 };
 static ScriptHost& host() { static ScriptHost h; return h; }
 
+static std::atomic<uint32_t> g_busy{0};
 static bool runLine(const std::string& src) {
-  hrs::ScriptError e;
-  if (host().I.run(src, e, true)) return true;
-  emit(e.format(), TFT_RED);
-  kernel::log("script %s", e.format().c_str());
-  return false;
+  uint32_t now = millis(), b = g_busy.load();
+  if (b && now - b < 10000) { emit("interpreter busy", TFT_RED); return false; }
+  g_busy = now ? now : 1;
+  size_t before; { std::lock_guard<std::recursive_mutex> lk(g_mx); before = g_out.size(); }
+  hrs::ScriptError e; bool ok = host().I.run(src, e, true);
+  g_busy = 0;
+  if (!ok) { emit(e.format(), TFT_RED); sys::log("script %s", e.format().c_str()); }
+  std::lock_guard<std::recursive_mutex> lk(g_mx);
+  Hist h{++g_histId, millis(), millis() - now, ok, src, ""};
+  if (ok && g_out.size() > before) h.out = g_out[before].s;
+  g_hist.push_back(h); if (g_hist.size() > 60) g_hist.erase(g_hist.begin());
+  return ok;
 }
 std::string scriptRun(const std::string& src) {
   size_t before = g_out.size(); runLine(src);
@@ -77,12 +93,25 @@ std::string scriptRun(const std::string& src) {
 }
 
 // ================= Console =================
+static std::string fmtUp(uint32_t ms) { char b[16]; uint32_t s = ms / 1000; snprintf(b, sizeof b, "%02u:%02u:%02u", (unsigned)(s / 3600), (unsigned)((s / 60) % 60), (unsigned)(s % 60)); return b; }
+static std::string clip(std::string s, size_t n) { for (auto& c : s) if (c == '\n' || c == '\t') c = ' '; if (s.size() > n) s = s.substr(0, n - 1) + "~"; return s; }
+static bool isErrLine(const std::string& s) {
+  static const char* k[] = {"FAULT", "CRASH", "PANIC", "script ", "not responding", "denied", "force-killing", "DisplayError", "DISPLAY"};
+  for (auto p : k) if (s.find(p) != std::string::npos) return true;
+  return false;
+}
+
 class Console : public App {
-  int mode; M5Canvas* scr = nullptr; std::string in; bool sym = false, shift = false; int down = -1;
+  int mode = 0; bool gfx = false; M5Canvas* scr = nullptr; std::string in; bool sym = false, shift = false; int down = -1;
+  uint32_t loadT = 0, dispT = 0; std::string dispLine;
   struct Key { int x, y, w, h; std::string label; char ch; int sp; };   // sp: 1 shift, 2 backspace, 3 layer, 4 enter, 5 space
-  std::vector<Key> keys;
+  struct Btn { int x, w; const char* label; int id; };
+  std::vector<Key> keys; std::vector<Btn> btns; int kbY = 826, kbH = 80, inY = 774;
+  bool dash() const { return mode == 0 && !gfx; }
+
   void layout() {
-    keys.clear(); const int ky = 858, kh = 74;
+    kbY = dash() ? 826 : 858; kbH = dash() ? 80 : 74; inY = dash() ? 774 : 806;
+    keys.clear(); const int ky = kbY, kh = kbH;
     static const char* L[2][4] = {{"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"}, {"1234567890", "(){}[];:\"'", "+-*/%=<>!_", ".,?#@&|~"}};
     for (int r = 0; r < 4; r++) {
       std::string row = L[sym][r]; int n = row.size(), w = 68, tot = n * w + (n - 1) * 6, x0 = (SW - tot) / 2;
@@ -95,11 +124,14 @@ class Console : public App {
     keys.push_back({8, y, 96, kh, "shift", 0, 1}); keys.push_back({SW - 104, y, 96, kh, "del", 0, 2});
     y += kh + 6;
     keys.push_back({8, y, 130, kh, sym ? "abc" : "123", 0, 3}); keys.push_back({146, y, 420, kh, "space", ' ', 5}); keys.push_back({574, y, 138, kh, "run", 0, 4});
+    btns.clear();
+    if (mode == 0) { static const char* BL[] = {"GFX", "CLR", "COLOR", "SHELL"}; for (int i = 0; i < 4; i++) btns.push_back({SW - 6 - (4 - i) * 92, 88, BL[i], i}); }
+    else btns.push_back({SW - 6 - 120, 116, "SCRIPT", 3});
   }
   int hit(int px, int py) { for (size_t i = 0; i < keys.size(); i++) { auto& k = keys[i]; if (px >= k.x && px < k.x + k.w && py >= k.y - 3 && py < k.y + k.h + 3) return i; } return -1; }
   void submit() {
     emit((mode ? "$ " : "> ") + in, rgb(120, 200, 255));
-    if (mode) emit(kernel::exec(in)); else runLine(in);
+    if (mode) emit(sys::kshell(in)); else runLine(in);
     in.clear();
   }
   void type(const Key& k) {
@@ -110,64 +142,150 @@ class Console : public App {
     else { in += k.ch; shift = false; }
     layout();
   }
- public:
-  explicit Console(int m) : mode(m) {}
-  const char* name() const override { return "Console"; }
-  uint16_t bg() const override { return C565(12, 12, 16); }
-  void onLaunch() override {
-    layout();
-    if (!mode) {
-      scr = new M5Canvas(&M5.Display); scr->setPsram(true); scr->setColorDepth(16);
-      if (!scr->createSprite(SW, 420)) { delete scr; scr = nullptr; throw std::bad_alloc(); }
-      scr->fillSprite(TFT_BLACK); host().scr = scr;
+  void press(int id) {
+    if (id == 0) { gfx = !gfx; loadT = millis(); layout(); }
+    else if (id == 1) { std::lock_guard<std::recursive_mutex> lk(g_mx); g_hist.clear(); g_out.clear(); }
+    else if (id == 2) g_themeIdx = (g_themeIdx + 1) % 5;
+    else if (id == 3) sys::launch("Console", mode ? "script" : "shell");
+  }
+
+  // ---- dashboard helpers ----
+  void pane(M5Canvas& g, int x, int y, int w, int h, const char* title, uint16_t c) {
+    g.drawRect(x, y, w, h, c); g.fillRect(x, y, w, 22, c);
+    uiFont(&g, &fonts::Font2); uiSize(&g, 1); g.setTextColor(TFT_BLACK, c); g.setTextDatum(middle_left); g.drawString(title, x + 6, y + 11);
+    g.setClipRect(x + 3, y + 24, w - 6, h - 26);
+  }
+  void ln(M5Canvas& g, int x, int y, const std::string& s, uint16_t c) { g.setTextColor(c); g.setTextDatum(top_left); g.drawString(s.c_str(), x, y); }
+
+  void drawDash(M5Canvas& g) {
+    uint16_t th = kThemes[g_themeIdx], dim = rgb(120, 120, 120); const int L = 17;
+    // ---- 4: SCRIPTS (top) ----
+    pane(g, 6, 102, SW - 12, 220, "SCRIPTS - executed", th);
+    {
+      std::vector<Line> rows;
+      for (auto& h : g_hist) {
+        char b[48]; snprintf(b, sizeof b, "#%-3u %s %s %ums ", (unsigned)h.id, fmtUp(h.t).c_str(), h.ok ? "ok " : "ERR", (unsigned)h.ms);
+        rows.push_back({std::string(b) + clip(h.src, 70), h.ok ? th : (uint16_t)TFT_RED});
+        if (!h.out.empty()) rows.push_back({"     > " + clip(h.out, 80), dim});
+      }
+      int n = (220 - 28) / L, from = (int)rows.size() > n ? rows.size() - n : 0;
+      for (size_t i = from; i < rows.size(); i++) ln(g, 10, 128 + (i - from) * L, rows[i].s, rows[i].col);
+      if (rows.empty()) ln(g, 10, 128, "no scripts yet - type below and press run", dim);
     }
+    g.clearClipRect();
+    // ---- 1: ERRORS (middle) ----
+    pane(g, 6, 326, SW - 12, 220, "ERRORS - display + runtime", th);
+    {
+      if (millis() - dispT > 1000 || dispLine.empty()) { dispT = millis(); dispLine = sys::kshell("display"); }
+      bool ok = dispLine.size() >= 2 && dispLine.compare(dispLine.size() - 2, 2, "OK") == 0;
+      int y = 352; ln(g, 10, y, "DISPLAY " + clip(dispLine, 80), ok ? th : (uint16_t)TFT_RED); y += L;
+      if (!ok) { ln(g, 10, y, "E_DISPLAY_SIZE: panel size differs from the size this OS was built for", TFT_RED); y += L; }
+      auto lg = sys::logTail(64); std::vector<std::string> es;
+      for (auto& s : lg) if (isErrLine(s)) es.push_back(s);
+      int rows = (544 - y) / L; size_t from = (int)es.size() > rows ? es.size() - rows : 0;
+      for (size_t i = from; i < es.size(); i++) {
+        bool hard = es[i].find("FAULT") != std::string::npos || es[i].find("CRASH") != std::string::npos || es[i].find("PANIC") != std::string::npos;
+        ln(g, 10, y, clip(es[i], 84), hard ? (uint16_t)TFT_RED : rgb(255, 176, 0)); y += L;
+      }
+      if (es.empty()) ln(g, 10, y, "no errors", dim);
+    }
+    g.clearClipRect();
+    // ---- 2: USERS (bottom left) ----
+    pane(g, 6, 550, 350, 220, "USERS", th);
+    {
+      auto procs = sys::procList();
+      uint32_t shown = millis() - loadT;   // one entry appears per millisecond while loading
+      ln(g, 10, 576, "PID", th); ln(g, 56, 576, "USER", th); ln(g, 112, 576, "NAME", th); ln(g, 250, 576, "STATE", th);
+      int y = 576 + L;
+      for (size_t i = 0; i < procs.size() && i < shown; i++) {
+        auto& p = procs[i]; std::string u = p.user.empty() ? "root" : p.user;   // no other users exist: everything is root
+        ln(g, 10, y, std::to_string(p.pid), th); ln(g, 56, y, u, u == "root" ? rgb(255, 80, 80) : th);
+        ln(g, 112, y, clip(p.name, 14), th); ln(g, 250, y, p.state, dim); y += L;
+      }
+      if (shown < procs.size()) ln(g, 10, y, "loading...", dim);
+    }
+    g.clearClipRect();
+    // ---- 3: RUNTIME / WATCHDOG (bottom right) ----
+    pane(g, 362, 550, 352, 220, "RUNTIME / WATCHDOG", th);
+    {
+      sys::RuntimeInfo r = sys::runtime(); char b[96]; int y = 576, x = 368;
+      ln(g, x, y, "up      " + fmtUp(r.uptimeMs), th); y += L;
+      snprintf(b, sizeof b, "present %u/s   work %u ms", (unsigned)r.fps, (unsigned)r.frameMs); ln(g, x, y, b, th); y += L;
+      snprintf(b, sizeof b, "heap    %uK (min %uK)", (unsigned)(r.heapFree >> 10), (unsigned)(r.heapMin >> 10)); ln(g, x, y, b, th); y += L;
+      snprintf(b, sizeof b, "psram   %.1fM free   %u MHz", r.psramFree / 1048576.0, (unsigned)r.cpuMHz); ln(g, x, y, b, th); y += L + 4;
+      ln(g, x, y, "-- watchdog --", dim); y += L;
+      snprintf(b, sizeof b, "limit   %u ms   kills %u", (unsigned)r.watchdogLimitMs, (unsigned)r.kills); ln(g, x, y, b, th); y += L;
+      const char* wd = r.fgBeatAgeMs > r.watchdogLimitMs ? "STALL" : r.fgBeatAgeMs > r.watchdogLimitMs / 2 ? "WARN" : "OK";
+      uint16_t wc = r.fgBeatAgeMs > r.watchdogLimitMs ? (uint16_t)TFT_RED : r.fgBeatAgeMs > r.watchdogLimitMs / 2 ? rgb(255, 176, 0) : th;
+      snprintf(b, sizeof b, "fg %s  beat %u ms  %s", clip(r.fgName, 12).c_str(), (unsigned)r.fgBeatAgeMs, wd); ln(g, x, y, b, wc); y += L;
+      ln(g, x, y, "reset   " + clip(r.resetReason, 28), dim);
+    }
+    g.clearClipRect();
+  }
+
+  void drawPlain(M5Canvas& g) {
+    int top = 112, bot = inY;
+    if (scr && gfx) { scr->pushSprite(&g, 0, top); top += 428; }
+    uiFont(&g, &fonts::Font2); uiSize(&g, 1.3f); g.setTextDatum(top_left);
+    int lh = 26, n = (bot - top) / lh, from = (int)g_out.size() > n ? g_out.size() - n : 0;
+    for (size_t i = from; i < g_out.size(); i++) { g.setTextColor(g_out[i].col); g.drawString(g_out[i].s.c_str(), 16, top + (i - from) * lh); }
+  }
+
+ public:
+  const char* name() const override { return "Console"; }
+  uint16_t bg() const override { return rgb(0, 0, 0); }
+  int idleMs() const override { return 250; }
+  bool animating() const override { return dash() && millis() - loadT < 120; }
+  void onLaunch() override {
+    mode = strcmp(sys::arg(), "shell") == 0 ? 1 : 0;
+    loadT = millis(); layout();
+    if (!mode) { scr = sys::newCanvas(SW, 420); scr->fillSprite(TFT_BLACK); host().scr = scr; }
     if (g_out.empty()) emit(mode ? "HRS OS kernel shell - type 'help'" : "HRScript REPL - e.g. let x = 2; print(x*21);", rgb(150, 150, 160));
   }
-  void onClose() override { host().scr = nullptr; delete scr; scr = nullptr; }
+  void onClose() override { host().scr = nullptr; sys::freeCanvas(scr); scr = nullptr; }
   void onTouch(const Touch& t) override {
     if (t.pressed || t.down) down = hit(t.x, t.y);
-    if (t.pressed && t.y > 60 && t.y < 104 && t.x > SW - 220) { g_consoleMode = mode ? 0 : 1; shell::requestLaunch("Console"); return; }
+    if (t.pressed && t.y >= 60 && t.y <= 100) { for (auto& b : btns) if (t.x >= b.x && t.x < b.x + b.w) { press(b.id); return; } }
     if (t.released) { int k = hit(t.x, t.y); if (k >= 0 && k == hit(t.sx, t.sy)) type(keys[k]); down = -1; }
   }
   void onDraw(M5Canvas& g) override {
-    g.setTextDatum(middle_left); g.setFont(&fonts::FreeSansBold12pt7b); g.setTextSize(1); g.setTextColor(TFT_WHITE);
-    g.drawString(mode ? "Kernel shell" : "HRScript console", 30, 82);
-    g.setTextDatum(middle_right); g.setTextColor(rgb(10, 132, 255)); g.drawString(mode ? "switch to script" : "switch to shell", SW - 30, 82);
-    int top = 112;
-    if (scr) { scr->pushSprite(&g, 0, top); top += 428; }
-    int bot = 806;
-    g.setFont(&fonts::Font2); g.setTextSize(1.3f); g.setTextDatum(top_left);
-    int lh = 26, n = (bot - top) / lh, from = (int)g_out.size() > n ? g_out.size() - n : 0;
-    for (size_t i = from; i < g_out.size(); i++) { g.setTextColor(g_out[i].col); g.drawString(g_out[i].s.c_str(), 16, top + (i - from) * lh); }
-    g.fillRoundRect(10, bot + 2, SW - 20, 44, 10, C565(40, 40, 48));
-    g.setTextColor(TFT_WHITE); g.drawString(((mode ? "$ " : "> ") + in + ((millis() / 500) % 2 ? "_" : "")).c_str(), 24, bot + 12);
-    g.setFont(&fonts::FreeSans12pt7b); g.setTextSize(1); g.setTextDatum(middle_center);
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
+    uint16_t th = kThemes[g_themeIdx];
+    uiFont(&g, &fonts::FreeSansBold12pt7b); uiSize(&g, 1); g.setTextDatum(middle_left); g.setTextColor(mode ? (uint16_t)TFT_WHITE : th);
+    g.drawString(mode ? "Kernel shell" : "HRScript", 24, 80);
+    for (auto& b : btns) { g.drawRoundRect(b.x, 62, b.w, 36, 6, th); uiFont(&g, &fonts::Font2); uiSize(&g, 1); g.setTextColor(th); g.setTextDatum(middle_center); g.drawString(b.label, b.x + b.w / 2, 80); }
+    if (dash()) drawDash(g); else drawPlain(g);
+    g.drawRoundRect(10, inY + 2, SW - 20, 44, 10, th);
+    uiFont(&g, &fonts::Font2); uiSize(&g, 1.3f); g.setTextColor(TFT_WHITE); g.setTextDatum(top_left);
+    g.drawString(((mode ? "$ " : "> ") + in + ((millis() / 500) % 2 ? "_" : "")).c_str(), 24, inY + 12);
+    uiFont(&g, &fonts::FreeSans12pt7b); uiSize(&g, 1); g.setTextDatum(middle_center);
     for (size_t i = 0; i < keys.size(); i++) {
       auto& k = keys[i]; bool special = k.sp != 0 && k.sp != 5;
-      uint16_t col = (int)i == down ? C565(120, 120, 130) : special ? C565(60, 60, 70) : C565(95, 95, 105);
-      if (k.sp == 4) col = (int)i == down ? C565(60, 160, 255) : C565(10, 132, 255);
-      g.fillRoundRect(k.x, k.y, k.w, k.h, 12, col); g.setTextColor(TFT_WHITE); g.drawString(k.label.c_str(), k.x + k.w / 2, k.y + k.h / 2);
+      uint16_t c = (int)i == down ? rgb(120, 120, 130) : special ? rgb(60, 60, 70) : rgb(95, 95, 105);
+      if (k.sp == 4) c = (int)i == down ? rgb(60, 160, 255) : rgb(10, 132, 255);
+      g.fillRoundRect(k.x, k.y, k.w, k.h, 12, c); g.setTextColor(TFT_WHITE); g.drawString(k.label.c_str(), k.x + k.w / 2, k.y + k.h / 2);
     }
   }
 };
 
 // ================= Settings =================
 class Settings : public App {
-  float devAnim = 0, fpsAnim = 0; bool sliding = false; uint32_t brightness = 180;
-  static constexpr int RH = 76, GX = 30, GW = SW - 60;
-  int cy; M5Canvas* G; int tx, ty; bool tap, drag;
+  enum Page { ROOT, DISPLAY, BATTERY, ABOUT, DEV };
+  Page page = ROOT; float devAnim = 0, fpsAnim = 0; uint32_t brightness = 180;
+  static constexpr int RH = 84, GX = 30, GW = SW - 60;
+  int cy = 0, gy0 = 0; M5Canvas* G = nullptr; int tx = 0, ty = 0; bool tap = false, drag = false;
+
   void group(const char* title, int rows) {
     if (G) {
-      G->setFont(&fonts::FreeSans9pt7b); G->setTextSize(1); G->setTextColor(rgb(110, 110, 118)); G->setTextDatum(bottom_left); G->drawString(title, GX + 16, cy - 6);
+      uiFont(G, &fonts::FreeSans9pt7b); uiSize(G, 1); G->setTextColor(rgb(110, 110, 118)); G->setTextDatum(bottom_left); G->drawString(title, GX + 16, cy - 6);
       G->fillRoundRect(GX, cy, GW, rows * RH, 22, TFT_WHITE);
     }
-    gy0 = cy; cy += 0;
+    gy0 = cy;
   }
-  int gy0 = 0;
   bool rowHit(int y) { return tap && tx >= GX && tx < GX + GW && ty >= y && ty < y + RH; }
   void label(int y, const char* l, const char* v, uint16_t lc = TFT_BLACK) {
     if (!G) return;
-    G->setFont(&fonts::FreeSans12pt7b); G->setTextSize(1); G->setTextColor(lc); G->setTextDatum(middle_left); G->drawString(l, GX + 24, y + RH / 2);
+    uiFont(G, &fonts::FreeSans12pt7b); uiSize(G, 1); G->setTextColor(lc); G->setTextDatum(middle_left); G->drawString(l, GX + 24, y + RH / 2);
     if (v) { G->setTextColor(rgb(130, 130, 138)); G->setTextDatum(middle_right); G->drawString(v, GX + GW - 24, y + RH / 2); }
     if (y > gy0) G->drawFastHLine(GX + 24, y, GW - 24, rgb(220, 220, 226));
   }
@@ -177,49 +295,77 @@ class Settings : public App {
     G->fillRoundRect(x, yy, 76, 44, 22, anim > 0.5f ? rgb(52, 199, 89) : rgb(210, 210, 216));
     G->fillCircle(x + 22 + (int)(32 * anim), yy + 22, 19, TFT_WHITE);
   }
+  void nav(int y, const char* l, uint16_t chip, Page to) {   // category row: coloured chip, title, chevron
+    if (G) {
+      G->fillRoundRect(GX + 20, y + 20, 44, 44, 11, chip); G->fillCircle(GX + 42, y + 42, 9, TFT_WHITE);
+      uiFont(G, &fonts::FreeSans12pt7b); uiSize(G, 1); G->setTextColor(TFT_BLACK); G->setTextDatum(middle_left); G->drawString(l, GX + 84, y + RH / 2);
+      G->setTextColor(rgb(190, 190, 196)); G->setTextDatum(middle_right); G->drawString(">", GX + GW - 24, y + RH / 2);
+      if (y > gy0) G->drawFastHLine(GX + 84, y, GW - 84, rgb(220, 220, 226));
+    }
+    if (rowHit(y)) page = to;
+  }
   void pass(M5Canvas* g) {
-    G = g; cy = 150; char b[48];
-    if (G) { G->setFont(&fonts::FreeSansBold24pt7b); G->setTextSize(1.25f); G->setTextColor(TFT_BLACK); G->setTextDatum(middle_left); G->drawString("Settings", 36, 100); }
-    cy += 20; group("DISPLAY", 1); {
+    G = g; Page pg = page; char b[48]; cy = 170;
+    if (G) {
+      if (pg == ROOT) { uiFont(G, &fonts::FreeSansBold24pt7b); uiSize(G, 1.25f); G->setTextColor(TFT_BLACK); G->setTextDatum(middle_left); G->drawString("Settings", 36, 100); }
+      else {
+        static const char* T[] = {"", "Display", "Battery", "About", "Developer"};
+        uiFont(G, &fonts::FreeSans12pt7b); uiSize(G, 1.1f); G->setTextColor(rgb(0, 122, 255)); G->setTextDatum(middle_left); G->drawString("< Settings", 30, 100);
+        uiFont(G, &fonts::FreeSansBold12pt7b); uiSize(G, 1.3f); G->setTextColor(TFT_BLACK); G->setTextDatum(middle_center); G->drawString(T[pg], SW / 2 + 40, 100);
+      }
+    }
+    if (pg != ROOT && tap && tx < 300 && ty > 56 && ty < 150) { page = ROOT; return; }
+    if (pg == ROOT) {
+      cy += 20; group("", 4);
+      nav(cy, "Display & Brightness", rgb(10, 132, 255), DISPLAY);
+      nav(cy + RH, "Battery", rgb(52, 199, 89), BATTERY);
+      nav(cy + 2 * RH, "About", rgb(142, 142, 147), ABOUT);
+      nav(cy + 3 * RH, "Developer", rgb(255, 149, 0), DEV);
+    } else if (pg == DISPLAY) {
+      group("BRIGHTNESS", 1);
       label(cy, "Brightness", nullptr);
       int sx = GX + 250, sw = GW - 290, sy = cy + RH / 2;
       if (G) { G->fillRoundRect(sx, sy - 4, sw, 8, 4, rgb(210, 210, 216)); int kx = sx + sw * brightness / 255; G->fillRoundRect(sx, sy - 4, kx - sx, 8, 4, rgb(10, 132, 255)); G->fillCircle(kx, sy, 17, TFT_WHITE); G->drawCircle(kx, sy, 17, rgb(190, 190, 196)); }
       if (drag && ty >= cy && ty < cy + RH && tx >= sx - 20 && tx <= sx + sw + 20) {
-        int v = (tx - sx) * 255 / sw; brightness = v < 10 ? 10 : v > 255 ? 255 : v; M5.Display.setBrightness(brightness);
+        int v = (tx - sx) * 255 / sw; brightness = v < 10 ? 10 : v > 255 ? 255 : v; sys::setBrightness((int)brightness);
       }
-    }
-    cy += RH + 54; group("ABOUT", 5); {
-      int y = cy;
+    } else if (pg == BATTERY) {
+      group("BATTERY", 2);
+      snprintf(b, sizeof b, "%d%%", sys::battery()); label(cy, "Charge", b);
+      if (G) { int lv = sys::battery(); if (lv < 0) lv = 0; if (lv > 100) lv = 100; int bw = GW - 48; G->fillRoundRect(GX + 24, cy + RH + 30, bw, 24, 12, rgb(220, 220, 226)); G->fillRoundRect(GX + 24, cy + RH + 30, bw * lv / 100, 24, 12, lv <= 20 ? rgb(255, 59, 48) : rgb(52, 199, 89)); }
+    } else if (pg == ABOUT) {
+      group("ABOUT", 5); int y = cy;
       label(y, "Model", "M5Stack Tab5"); y += RH;
-      label(y, "Kernel", "HRS OS 0.1"); y += RH;
-      snprintf(b, sizeof b, "%d x %d", M5.Display.width(), M5.Display.height()); label(y, "Display", b); y += RH;
-      snprintf(b, sizeof b, "%u MB PSRAM free", (unsigned)(ESP.getFreePsram() >> 20)); label(y, "Memory", b); y += RH;
-      snprintf(b, sizeof b, "%d%%", (int)M5.Power.getBatteryLevel()); label(y, "Battery", b);
-    }
-    cy += 5 * RH + 54; group("DEVELOPER", kernel::devMode() ? 6 : 1); {
-      int y = cy;
-      label(y, "Developer Mode", nullptr); toggle(y, devAnim);
-      if (rowHit(y)) kernel::setDevMode(!kernel::devMode());
-      if (kernel::devMode()) {
-        y += RH; label(y, "HRScript Console", ">"); if (rowHit(y)) { g_consoleMode = 0; shell::requestLaunch("Console"); }
-        y += RH; label(y, "Kernel Shell", ">"); if (rowHit(y)) { g_consoleMode = 1; shell::requestLaunch("Console"); }
-        y += RH; label(y, "Show FPS", nullptr); toggle(y, fpsAnim); if (rowHit(y)) g_showFps = !g_showFps;
-        y += RH; label(y, "Raise test fault", nullptr, rgb(0, 122, 255)); if (rowHit(y)) kernel::fault(kernel::E_APP_FAULT, "Test fault raised from Settings > Developer.");
-        y += RH; label(y, "Trigger kernel panic", nullptr, TFT_RED); if (rowHit(y)) kernel::panic(kernel::E_APP_FAULT, "Test panic triggered from Settings > Developer.");
+      label(y, "Kernel", "HRS OS 0.2"); y += RH;
+      snprintf(b, sizeof b, "%d x %d", sys::displayW(), sys::displayH()); label(y, "Display", b); y += RH;
+      snprintf(b, sizeof b, "%u MB PSRAM free", (unsigned)(sys::freePsram() >> 20)); label(y, "Memory", b); y += RH;
+      uint32_t s = millis() / 1000; snprintf(b, sizeof b, "%uh %02um", (unsigned)(s / 3600), (unsigned)((s / 60) % 60)); label(y, "Uptime", b);
+    } else {
+      group("DEVELOPER", 1);
+      label(cy, "Developer Mode", nullptr); toggle(cy, devAnim);
+      if (rowHit(cy)) sys::setDevMode(!sys::devMode());
+      if (sys::devMode()) {
+        cy += RH + 54; group("TOOLS", 5); int y = cy;
+        label(y, "HRScript Console", ">"); if (rowHit(y)) sys::launch("Console", "script");
+        y += RH; label(y, "Kernel Shell", ">"); if (rowHit(y)) sys::launch("Console", "shell");
+        y += RH; label(y, "Show FPS", nullptr); toggle(y, fpsAnim); if (rowHit(y)) sys::setShowFps(!sys::showFps());
+        y += RH; label(y, "Raise test fault", nullptr, rgb(0, 122, 255)); if (rowHit(y)) sys::raiseFault(0x3001, "Test fault raised from Settings > Developer.");
+        y += RH; label(y, "Trigger kernel panic", nullptr, TFT_RED); if (rowHit(y)) sys::requestPanic("Test panic triggered from Settings > Developer.");
       }
     }
   }
  public:
   const char* name() const override { return "Settings"; }
   bool darkStatusBar() const override { return true; }
-  uint16_t bg() const override { return C565(242, 242, 247); }
-  void onLaunch() override { devAnim = kernel::devMode(); fpsAnim = g_showFps; }
+  uint16_t bg() const override { return rgb(242, 242, 247); }
+  bool animating() const override { return fabsf(devAnim - (sys::devMode() ? 1.f : 0.f)) > 0.01f || fabsf(fpsAnim - (sys::showFps() ? 1.f : 0.f)) > 0.01f; }
+  void onLaunch() override { devAnim = sys::devMode(); fpsAnim = sys::showFps(); }
   void onTouch(const Touch& t) override {
     tx = t.x; ty = t.y; tap = t.released && abs(t.x - t.sx) < 20 && abs(t.y - t.sy) < 20; drag = t.down;
     if (tap || drag) pass(nullptr);
   }
   void onDraw(M5Canvas& g) override {
-    devAnim += ((kernel::devMode() ? 1.f : 0.f) - devAnim) * 0.3f; fpsAnim += ((g_showFps ? 1.f : 0.f) - fpsAnim) * 0.3f;
+    devAnim += ((sys::devMode() ? 1.f : 0.f) - devAnim) * 0.3f; fpsAnim += ((sys::showFps() ? 1.f : 0.f) - fpsAnim) * 0.3f;
     tap = false; drag = false; pass(&g);
   }
 };
@@ -244,15 +390,16 @@ class Calc : public App {
   }
  public:
   const char* name() const override { return "Calculator"; }
+  int idleMs() const override { return 60000; }
   uint16_t bg() const override { return TFT_BLACK; }
   void onTouch(const Touch& t) override {
     if (t.down) down = hit(t.x, t.y);
     if (t.released) { int a = hit(t.x, t.y); if (a >= 0 && a == hit(t.sx, t.sy)) press(L(a)); down = -1; }
   }
   void onDraw(M5Canvas& g) override {
-    g.setFont(&fonts::FreeSansBold24pt7b); g.setTextColor(TFT_WHITE); g.setTextDatum(bottom_right);
-    g.setTextSize(cur.size() > 9 ? 1.5f : cur.size() > 6 ? 2.0f : 2.6f); g.drawString(cur.c_str(), SW - 36, Y0 - 30);
-    g.setFont(&fonts::FreeSansBold18pt7b); g.setTextSize(1);
+    uiFont(&g, &fonts::FreeSansBold24pt7b); g.setTextColor(TFT_WHITE); g.setTextDatum(bottom_right);
+    uiSize(&g, cur.size() > 9 ? 1.5f : cur.size() > 6 ? 2.0f : 2.6f); g.drawString(cur.c_str(), SW - 36, Y0 - 30);
+    uiFont(&g, &fonts::FreeSansBold18pt7b); uiSize(&g, 1);
     for (int i = 0; i < 19; i++) {
       int x, y, w; rect(i, x, y, w); std::string k = L(i); bool opk = i % 4 == 3 || i == 18, top = i < 3;
       bool active = opk && op && k[0] == op && fresh && k != "=";
@@ -272,7 +419,7 @@ class ClockApp : public App {
   const char* name() const override { return "Clock"; }
   uint16_t bg() const override { return TFT_BLACK; }
   void onDraw(M5Canvas& g) override {
-    int h = 0, m = 0, s = 0; sscanf(timeString(true).c_str(), "%d:%d:%d", &h, &m, &s);
+    int h = 0, m = 0, s = 0; sscanf(sys::timeString(true).c_str(), "%d:%d:%d", &h, &m, &s);
     int cx = SW / 2, cy = 500, R = 290;
     g.fillCircle(cx, cy, R, C565(28, 28, 30)); g.drawCircle(cx, cy, R, C565(70, 70, 74));
     for (int i = 0; i < 60; i++) {
@@ -282,10 +429,10 @@ class ClockApp : public App {
     auto hand = [&](float a, int len, int wd, uint16_t col) { float dx = sinf(a), dy = -cosf(a); for (int o = -wd / 2; o <= wd / 2; o++) g.drawLine(cx + o * dy, cy + o * dx, cx + dx * len + o * dy, cy + dy * len + o * dx, col); };
     hand((h % 12 + m / 60.f) * PI / 6, 150, 12, TFT_WHITE); hand((m + s / 60.f) * PI / 30, 225, 8, TFT_WHITE);
     hand(s * PI / 30, 255, 3, C565(255, 149, 0)); g.fillCircle(cx, cy, 12, C565(255, 149, 0));
-    g.setFont(&fonts::FreeSansBold24pt7b); g.setTextSize(1.6f); g.setTextColor(TFT_WHITE); g.setTextDatum(middle_center);
-    g.drawString(timeString(true).c_str(), cx, 940);
+    uiFont(&g, &fonts::FreeSansBold24pt7b); uiSize(&g, 1.6f); g.setTextColor(TFT_WHITE); g.setTextDatum(middle_center);
+    g.drawString(sys::timeString(true).c_str(), cx, 940);
     uint32_t u = millis() / 1000; char b[48]; snprintf(b, sizeof b, "Uptime %uh %02um %02us", u / 3600, (u / 60) % 60, u % 60);
-    g.setFont(&fonts::FreeSans12pt7b); g.setTextSize(1); g.setTextColor(C565(150, 150, 156)); g.drawString(b, cx, 1030);
+    uiFont(&g, &fonts::FreeSans12pt7b); uiSize(&g, 1); g.setTextColor(C565(150, 150, 156)); g.drawString(b, cx, 1030);
   }
 };
 
@@ -294,7 +441,7 @@ class ClockApp : public App {
 static void gSettings(M5Canvas& c, int x, int y, int) {
   for (int i = 0; i < 8; i++) { float t = i * PI / 4; c.fillCircle(x + cosf(t) * 40, y + sinf(t) * 40, 13, rgb(225, 225, 230)); }
   c.fillCircle(x, y, 40, rgb(225, 225, 230)); c.fillCircle(x, y, 20, rgb(120, 120, 128)); c.fillCircle(x, y, 13, rgb(200, 200, 206)); }
-static void gConsole(M5Canvas& c, int x, int y, int) { c.setFont(&fonts::FreeSansBold18pt7b); c.setTextSize(1.1f); c.setTextColor(rgb(80, 230, 120)); c.setTextDatum(middle_center); c.drawString(">_", x, y); }
+static void gConsole(M5Canvas& c, int x, int y, int) { uiFont(&c, &fonts::FreeSansBold18pt7b); uiSize(&c, 1.1f); c.setTextColor(rgb(80, 230, 120)); c.setTextDatum(middle_center); c.drawString(">_", x, y); }
 static void gCalc(M5Canvas& c, int, int, int) {
   c.fillRoundRect(16, 16, 96, 28, 6, rgb(60, 60, 64));
   for (int r = 0; r < 3; r++) for (int k = 0; k < 4; k++) c.fillRoundRect(16 + k * 25, 52 + r * 21, 21, 17, 5, k == 3 ? rgb(255, 159, 10) : rgb(100, 100, 106)); }
@@ -342,7 +489,7 @@ const AppInfo kApps[] = {
   {"Music", C565(255,95,110), C565(235,30,70), gMusic, nullptr},
   {"Maps", C565(120,225,140), C565(60,185,110), gMaps, nullptr},
   {"Files", C565(255,255,255), C565(235,240,250), gFiles, nullptr},
-  {"Console", C565(40, 40, 46), C565(8, 8, 10), gConsole, []() -> App* { int m = g_consoleMode; return new Console(m); }},
+  {"Console", C565(40, 40, 46), C565(8, 8, 10), gConsole, []() -> App* { return new Console(); }},
 };
 const int kAppCount = sizeof(kApps) / sizeof(kApps[0]);
 const int kVisibleCount = kAppCount - 1;   // Console: reachable only via Settings > Developer

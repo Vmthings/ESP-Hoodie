@@ -16,6 +16,7 @@ void setup() {
 }
 
 void loop() {
+  if (kernel::isPanicking()) { delay(50); return; }
   M5.update();
   kernel::serialPoll();
   shellLoop();

@@ -4,6 +4,7 @@
 #include <esp_system.h>
 #include <cstdarg>
 #include <deque>
+#include <mutex>
 
 namespace kernel {
 
@@ -11,6 +12,12 @@ static std::vector<std::string> g_log;
 static std::deque<Fault> g_faults;
 static bool g_dev = false;
 static String g_serialLine;
+static std::recursive_mutex g_mx;
+static volatile bool g_pan = false;
+bool isPanicking() { return g_pan; }
+static const char* g_resetName = "unknown";
+const char* lastResetName() { return g_resetName; }
+std::vector<std::string> logCopy() { std::lock_guard<std::recursive_mutex> lk(g_mx); return g_log; }
 std::function<bool(const std::vector<std::string>&, std::string&)> ext;
 
 const char* errName(Err e) {
@@ -37,6 +44,7 @@ void log(const char* fmt, ...) {
   va_list ap; va_start(ap, fmt); std::string s = vfmt(fmt, ap); va_end(ap);
   char t[24]; snprintf(t, sizeof t, "[%7.2f] ", millis() / 1000.0f);
   s = t + s;
+  std::lock_guard<std::recursive_mutex> lk(g_mx);
   if (g_log.size() >= 64) g_log.erase(g_log.begin());
   g_log.push_back(s);
   Serial.println(s.c_str());
@@ -68,7 +76,8 @@ void begin() {
   Serial.begin(115200);
   Preferences p; p.begin("hrsos", true); g_dev = p.getBool("dev", false); p.end();
   esp_reset_reason_t r = esp_reset_reason();
-  log("HRS OS kernel 0.1 booting, last reset: %s", resetName(r));
+  g_resetName = resetName(r);
+  log("HRS OS kernel 0.2 booting, last reset: %s", resetName(r));
   if (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT || r == ESP_RST_BROWNOUT)
     fault(E_UNEXPECTED_RESET, "The previous session ended unexpectedly: %s.", resetName(r));
   if (!psramFound() || ESP.getPsramSize() == 0)
@@ -94,14 +103,17 @@ void checkDisplay() {
 void fault(Err code, const char* fmt, ...) {
   va_list ap; va_start(ap, fmt); std::string s = vfmt(fmt, ap); va_end(ap);
   log("FAULT 0x%04X %s: %s", (unsigned)code, errName(code), s.c_str());
+  std::lock_guard<std::recursive_mutex> lk(g_mx);
   g_faults.push_back({code, s});
 }
 bool pollFault(Fault& f) {
+  std::lock_guard<std::recursive_mutex> lk(g_mx);
   if (g_faults.empty()) return false;
   f = g_faults.front(); g_faults.pop_front(); return true;
 }
 
 void panic(Err code, const char* fmt, ...) {
+  g_pan = true;
   va_list ap; va_start(ap, fmt); std::string msg = vfmt(fmt, ap); va_end(ap);
   log("KERNEL PANIC 0x%04X %s: %s", (unsigned)code, errName(code), msg.c_str());
   // Draw straight to the panel with whatever size it reports (never trusts our own surfaces).
@@ -190,6 +202,7 @@ std::string exec(const std::string& line) {
     return b;
   }
   if (c == "log") {
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
     std::string o; size_t n = g_log.size();
     for (size_t i = n > 12 ? n - 12 : 0; i < n; i++) o += g_log[i] + "\n";
     return o;

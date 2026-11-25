@@ -37,6 +37,9 @@ void fault(Err code, const char* fmt, ...);  // non-fatal: shown as an alert by 
 bool pollFault(Fault& f);
 void log(const char* fmt, ...);
 const std::vector<std::string>& logLines();
+bool isPanicking();
+std::vector<std::string> logCopy();
+const char* lastResetName();   // true once a kernel panic screen is up (compositor stops)
 
 bool devMode();
 void setDevMode(bool on);

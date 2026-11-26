@@ -61,7 +61,8 @@ extern const AppInfo kApps[];
 extern const int kAppCount;
 extern const int kVisibleCount;                 // apps on the home screen (Console is hidden)
 App* makeSpringboard();                         // the home/lock screen app
-std::string scriptRun(const std::string& src);  // HRScript service, used by the kernel 'run' command
+std::string scriptRun(const std::string& src);
+std::string matrixCommand(const std::vector<std::string>& args);   // 'matrix [seconds]' (kernel shell + serial)  // HRScript service, used by the kernel 'run' command
 
 // ---- system calls (implemented by the kernel in sys.cpp) ----
 namespace sys {

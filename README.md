@@ -48,3 +48,10 @@ Errors carry line:col and a kind (SyntaxError, TypeError, RuntimeError, LimitErr
   USERS (bottom left: process table, everything owned by root, entries load one per millisecond), RUNTIME/WATCHDOG (bottom right).
   GFX toggles the script canvas, CLR clears history, SHELL switches to the kernel shell.
 - Performance: apps redraw only when dirty/animating/idle-timed, the compositor presents only changed frames, Springboard uses plain blits.
+
+## HRScript reference
+Statements: `let x = 1;`  `x = x + 1;`  `fn name(a, b) { return a + b; }`  `if cond { } else { }`  `while cond { }`  `for i in 0..10 { }`  `return v;`  `// comment`
+Types: number, string ("..." with \n \t \\ \"), nil. Operators: + - * / % == != < > <= >= && || ! (strings: + joins, == compares, < > order).
+Builtins: print(...) rgb(r,g,b) clear(c) rect(x,y,w,h,c) circle(x,y,r,c) line(x1,y1,x2,y2,c) text(x,y,s,size,c) width() height() millis() delay(ms 0-2000)
+rand(n) str(x) num(s) len(s) sqrt(x) sin(x) cos(x) abs(x) floor(x) heap() psram() brightness(0-255) matrix([seconds 0-60]).
+Shell: `matrix [seconds]` too (0 stops). Limits: 400k steps per run, call depth 40, canvas 720x420.

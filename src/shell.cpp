@@ -207,6 +207,7 @@ void shellSetup() {
     if (a[0] == "kill") { pendClose = true; out = "closing foreground app"; return true; }
     if (a[0] == "lock") { if (sb) { Event e{}; e.type = 3; strcpy(e.cmd, "lock"); xQueueSend(sb->q, &e, 0); } out = "locked"; return true; }
     if (a[0] == "run") { std::string src; for (size_t i = 1; i < a.size(); i++) src += (i > 1 ? " " : "") + a[i]; out = scriptRun(src); return true; }
+    if (a[0] == "matrix") { out = matrixCommand(a); return true; }
     return false;
   };
   lastUs = micros();

@@ -181,7 +181,7 @@ std::string exec(const std::string& line) {
   char b[256];
   if (c == "help")
     return "help info mem display log errors reboot dev [on|off]\n"
-           "apps ps launch <app> kill\n"
+           "apps ps launch <app> kill matrix [sec]\n"
            "dev only: run <hrscript> | panic [code] | fault | stackoverflow";
   if (c == "info") {
     snprintf(b, sizeof b, "HRS OS kernel 0.1 | %s | chip rev %d | %d MHz | uptime %.1fs | dev=%s",

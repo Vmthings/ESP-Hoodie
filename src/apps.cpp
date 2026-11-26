@@ -30,6 +30,51 @@ static void emit(const std::string& s, uint16_t col = TFT_WHITE) {
   while (g_out.size() > 300) g_out.erase(g_out.begin());
 }
 
+// ---- matrix digital rain (non-blocking: the Console draws it frame by frame) ----
+static std::atomic<uint32_t> g_matrixEnd{0};   // 0 = idle, 1 = stop requested, else millis() deadline
+static std::atomic<bool> g_wantGfx{false};
+static std::atomic<int> g_consoleMode{-1};     // -1 = Console not open, 0 = HRScript, 1 = kernel shell
+static bool matrixActive() { uint32_t e = g_matrixEnd.load(); return e > 1 && (int32_t)(e - millis()) > 0; }
+struct Rain { int cols = 0, rows = 0, w = 0, h = 0; std::vector<float> head, speed; std::vector<uint8_t> br; std::vector<char> ch; uint32_t last = 0; };
+static Rain g_rain;
+static void matrixStep(M5Canvas& g, int ox, int oy, int w, int h) {
+  const int CW = 14, CH = 18; Rain& m = g_rain;
+  static const char* GL = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ@#$%&*+=<>";
+  const int NG = strlen(GL);
+  if (m.w != w || m.h != h) {
+    m.w = w; m.h = h; m.cols = w / CW; m.rows = h / CH;
+    m.head.assign(m.cols, 0); m.speed.assign(m.cols, 0); m.br.assign(m.cols * m.rows, 0); m.ch.assign(m.cols * m.rows, '0');
+    for (int c = 0; c < m.cols; c++) { m.head[c] = -(float)(esp_random() % (m.rows + 1)); m.speed[c] = 8 + esp_random() % 18; }
+    m.last = millis();
+  }
+  uint32_t now = millis(); float dt = (now - m.last) / 1000.f; if (dt > 0.1f) dt = 0.1f; m.last = now;
+  int dec = (int)(dt * 300) + 1;
+  for (int c = 0; c < m.cols; c++) {
+    float prev = m.head[c]; m.head[c] += m.speed[c] * dt;
+    for (int r = (int)floorf(prev) + 1; r <= (int)floorf(m.head[c]); r++)
+      if (r >= 0 && r < m.rows) { m.br[r * m.cols + c] = 255; m.ch[r * m.cols + c] = GL[esp_random() % NG]; }
+    if (m.head[c] > m.rows + 24) { m.head[c] = -(float)(esp_random() % 12); m.speed[c] = 8 + esp_random() % 18; }
+  }
+  g.fillRect(ox, oy, w, h, TFT_BLACK); g.setClipRect(ox, oy, w, h);
+  uiFont(&g, &fonts::Font2); uiSize(&g, 1); g.setTextDatum(middle_center);
+  for (int r = 0; r < m.rows; r++) for (int c = 0; c < m.cols; c++) {
+    uint8_t& b = m.br[r * m.cols + c]; if (!b) continue;
+    uint16_t col = b >= 250 ? rgb(210, 255, 220) : rgb(0, b, b / 5);
+    if (b < 250) { b = b > dec ? b - dec : 0; if (esp_random() % 40 == 0) m.ch[r * m.cols + c] = GL[esp_random() % NG]; }
+    char s[2] = {m.ch[r * m.cols + c], 0}; g.setTextColor(col); g.drawString(s, ox + c * CW + CW / 2, oy + r * CH + CH / 2);
+    if (b >= 250) b = 249;   // head becomes trail on the next frame
+  }
+  g.clearClipRect();
+}
+std::string matrixCommand(const std::vector<std::string>& a) {
+  double s = a.size() > 1 ? atof(a[1].c_str()) : 10;
+  if (s < 0 || s > 60) return "usage: matrix [0-60 seconds]  (0 stops it)";
+  if (g_consoleMode.load() < 0) return "open the Console first (Settings > Developer > Console)";
+  g_matrixEnd = s == 0 ? 1 : millis() + (uint32_t)(s * 1000);
+  if (g_consoleMode.load() == 0) g_wantGfx = true;
+  return s == 0 ? "matrix stopped" : "matrix running...";
+}
+
 struct ScriptHost {
   hrs::Interp I; M5Canvas* scr = nullptr;
   ScriptHost() {
@@ -66,6 +111,7 @@ struct ScriptHost {
     I.bind("floor", [=](V& a) { need(a, 1, "floor(x)"); return Value::num(floor(num(a, 0))); });
     I.bind("heap", [](V&) { return Value::num(sys::freeHeap()); });
     I.bind("psram", [](V&) { return Value::num(sys::freePsram()); });
+    I.bind("matrix", [=](V& a) { if (a.size() > 1) throw std::invalid_argument("expected matrix([seconds])"); double s = a.empty() ? 10 : num(a, 0); if (s < 0 || s > 60) throw std::out_of_range("matrix seconds must be 0..60"); canvas(); g_matrixEnd = s == 0 ? 1 : millis() + (uint32_t)(s * 1000); g_wantGfx = true; return Value(); });
     I.bind("brightness", [=](V& a) { need(a, 1, "brightness(0..255)"); double b = num(a, 0); if (b < 0 || b > 255) throw std::out_of_range("brightness must be 0..255"); sys::setBrightness((int)b); return Value(); });
   }
 };
@@ -225,6 +271,7 @@ class Console : public App {
 
   void drawPlain(M5Canvas& g) {
     int top = 112, bot = inY;
+    if (mode == 1 && matrixActive()) { matrixStep(g, 0, top, SW, bot - top - 4); return; }
     if (scr && gfx) { scr->pushSprite(&g, 0, top); top += 428; }
     uiFont(&g, &fonts::Font2); uiSize(&g, 1.3f); g.setTextDatum(top_left);
     int lh = 26, n = (bot - top) / lh, from = (int)g_out.size() > n ? g_out.size() - n : 0;
@@ -235,14 +282,14 @@ class Console : public App {
   const char* name() const override { return "Console"; }
   uint16_t bg() const override { return rgb(0, 0, 0); }
   int idleMs() const override { return 250; }
-  bool animating() const override { return dash() && millis() - loadT < 120; }
+  bool animating() const override { return (dash() && millis() - loadT < 120) || matrixActive(); }
   void onLaunch() override {
-    mode = strcmp(sys::arg(), "shell") == 0 ? 1 : 0;
+    mode = strcmp(sys::arg(), "shell") == 0 ? 1 : 0; g_consoleMode = mode;
     loadT = millis(); layout();
     if (!mode) { scr = sys::newCanvas(SW, 420); scr->fillSprite(TFT_BLACK); host().scr = scr; }
     if (g_out.empty()) emit(mode ? "HRS OS kernel shell - type 'help'" : "HRScript REPL - e.g. let x = 2; print(x*21);", rgb(150, 150, 160));
   }
-  void onClose() override { host().scr = nullptr; sys::freeCanvas(scr); scr = nullptr; }
+  void onClose() override { g_consoleMode = -1; g_matrixEnd = 0; host().scr = nullptr; sys::freeCanvas(scr); scr = nullptr; }
   void onTouch(const Touch& t) override {
     if (t.pressed || t.down) down = hit(t.x, t.y);
     if (t.pressed && t.y >= 60 && t.y <= 100) { for (auto& b : btns) if (t.x >= b.x && t.x < b.x + b.w) { press(b.id); return; } }
@@ -251,6 +298,11 @@ class Console : public App {
   void onDraw(M5Canvas& g) override {
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     uint16_t th = kThemes[g_themeIdx];
+    if (g_wantGfx.exchange(false) && mode == 0 && !gfx) { gfx = true; layout(); }
+    if (mode == 0 && scr) {
+      if (matrixActive()) matrixStep(*scr, 0, 0, SW, 420);
+      else if (g_matrixEnd.load()) { g_matrixEnd = 0; scr->fillSprite(TFT_BLACK); }
+    } else if (mode == 1 && !matrixActive() && g_matrixEnd.load()) g_matrixEnd = 0;
     uiFont(&g, &fonts::FreeSansBold12pt7b); uiSize(&g, 1); g.setTextDatum(middle_left); g.setTextColor(mode ? (uint16_t)TFT_WHITE : th);
     g.drawString(mode ? "Kernel shell" : "HRScript", 24, 80);
     for (auto& b : btns) { g.drawRoundRect(b.x, 62, b.w, 36, 6, th); uiFont(&g, &fonts::Font2); uiSize(&g, 1); g.setTextColor(th); g.setTextDatum(middle_center); g.drawString(b.label, b.x + b.w / 2, 80); }

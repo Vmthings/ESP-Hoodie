@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include "app_api.h"
+#include "kbd.h"
 
 #define C565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
 
@@ -148,45 +149,28 @@ static bool isErrLine(const std::string& s) {
 }
 
 class Console : public App {
-  int mode = 0; bool gfx = false; M5Canvas* scr = nullptr; std::string in; bool sym = false, shift = false; int down = -1;
+  int mode = 0; bool gfx = false; M5Canvas* scr = nullptr; std::string in; Keyboard kb;
   uint32_t loadT = 0, dispT = 0; std::string dispLine;
-  struct Key { int x, y, w, h; std::string label; char ch; int sp; };   // sp: 1 shift, 2 backspace, 3 layer, 4 enter, 5 space
   struct Btn { int x, w; const char* label; int id; };
-  std::vector<Key> keys; std::vector<Btn> btns; int kbY = 826, kbH = 80, inY = 774;
+  std::vector<Btn> btns; int kbY = 826, kbH = 80, inY = 774;
   bool dash() const { return mode == 0 && !gfx; }
 
   void layout() {
-    kbY = dash() ? 826 : 858; kbH = dash() ? 80 : 74; inY = dash() ? 774 : 806;
-    keys.clear(); const int ky = kbY, kh = kbH;
-    static const char* L[2][4] = {{"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"}, {"1234567890", "(){}[];:\"'", "+-*/%=<>!_", ".,?#@&|~"}};
-    for (int r = 0; r < 4; r++) {
-      std::string row = L[sym][r]; int n = row.size(), w = 68, tot = n * w + (n - 1) * 6, x0 = (SW - tot) / 2;
-      for (int i = 0; i < n; i++) {
-        char ch = row[i]; if (!sym && shift && isalpha(ch)) ch = toupper(ch);
-        keys.push_back({x0 + i * (w + 6), ky + r * (kh + 6), w, kh, std::string(1, ch), ch, 0});
-      }
-    }
-    int y = ky + 3 * (kh + 6);
-    keys.push_back({8, y, 96, kh, "shift", 0, 1}); keys.push_back({SW - 104, y, 96, kh, "del", 0, 2});
-    y += kh + 6;
-    keys.push_back({8, y, 130, kh, sym ? "abc" : "123", 0, 3}); keys.push_back({146, y, 420, kh, "space", ' ', 5}); keys.push_back({574, y, 138, kh, "run", 0, 4});
+    kbY = dash() ? 826 : 858; kbH = 62; inY = dash() ? 774 : 806;
+    kb.layout(kbY, kbH, false); kb.setEnter("Run");
     btns.clear();
     if (mode == 0) { static const char* BL[] = {"GFX", "CLR", "COLOR", "SHELL"}; for (int i = 0; i < 4; i++) btns.push_back({SW - 6 - (4 - i) * 92, 88, BL[i], i}); }
     else btns.push_back({SW - 6 - 120, 116, "SCRIPT", 3});
   }
-  int hit(int px, int py) { for (size_t i = 0; i < keys.size(); i++) { auto& k = keys[i]; if (px >= k.x && px < k.x + k.w && py >= k.y - 3 && py < k.y + k.h + 3) return i; } return -1; }
   void submit() {
     emit((mode ? "$ " : "> ") + in, rgb(120, 200, 255));
     if (mode) emit(sys::kshell(in)); else runLine(in);
     in.clear();
   }
-  void type(const Key& k) {
-    if (k.sp == 1) shift = !shift;
-    else if (k.sp == 2) { if (!in.empty()) in.pop_back(); }
-    else if (k.sp == 3) sym = !sym;
-    else if (k.sp == 4) submit();
-    else { in += k.ch; shift = false; }
-    layout();
+  void key(const KbdEvent& e) {
+    if (e.sp == 0) in += e.ch;
+    else if (e.sp == 2) { if (!in.empty()) in.pop_back(); }
+    else if (e.sp == 4) submit();
   }
   void press(int id) {
     if (id == 0) { gfx = !gfx; loadT = millis(); layout(); }
@@ -291,9 +275,8 @@ class Console : public App {
   }
   void onClose() override { g_consoleMode = -1; g_matrixEnd = 0; host().scr = nullptr; sys::freeCanvas(scr); scr = nullptr; }
   void onTouch(const Touch& t) override {
-    if (t.pressed || t.down) down = hit(t.x, t.y);
     if (t.pressed && t.y >= 60 && t.y <= 100) { for (auto& b : btns) if (t.x >= b.x && t.x < b.x + b.w) { press(b.id); return; } }
-    if (t.released) { int k = hit(t.x, t.y); if (k >= 0 && k == hit(t.sx, t.sy)) type(keys[k]); down = -1; }
+    key(kb.touch(t));
   }
   void onDraw(M5Canvas& g) override {
     std::lock_guard<std::recursive_mutex> lk(g_mx);
@@ -310,13 +293,7 @@ class Console : public App {
     g.drawRoundRect(10, inY + 2, SW - 20, 44, 10, th);
     uiFont(&g, &fonts::Font2); uiSize(&g, 1.3f); g.setTextColor(TFT_WHITE); g.setTextDatum(top_left);
     g.drawString(((mode ? "$ " : "> ") + in + ((millis() / 500) % 2 ? "_" : "")).c_str(), 24, inY + 12);
-    uiFont(&g, &fonts::FreeSans12pt7b); uiSize(&g, 1); g.setTextDatum(middle_center);
-    for (size_t i = 0; i < keys.size(); i++) {
-      auto& k = keys[i]; bool special = k.sp != 0 && k.sp != 5;
-      uint16_t c = (int)i == down ? rgb(120, 120, 130) : special ? rgb(60, 60, 70) : rgb(95, 95, 105);
-      if (k.sp == 4) c = (int)i == down ? rgb(60, 160, 255) : rgb(10, 132, 255);
-      g.fillRoundRect(k.x, k.y, k.w, k.h, 12, c); g.setTextColor(TFT_WHITE); g.drawString(k.label.c_str(), k.x + k.w / 2, k.y + k.h / 2);
-    }
+    kb.draw(g);
   }
 };
 

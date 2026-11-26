@@ -7,7 +7,7 @@
 
 class Rpi : public App {
   enum St { FORM, WAIT_LOGIN, WAIT_PASS, WAIT_RESULT, TERM };
-  static constexpr int COLS = 59, TOP = 110, KB_Y = 870;
+  static constexpr int COLS = 59, TOP = 110, KB_Y = 896;
   St st = FORM; Keyboard kb; std::string user = "pi", pass, msg, info, recent; int focus = 0, pokes = 0, scrollBack = 0, lastY = 0;
   bool opened = false, power = false, termDrag = false; uint32_t stT = 0;
   std::vector<std::string> lines; std::string cur, escBuf; int col = 0, esc = 0;
@@ -67,7 +67,7 @@ class Rpi : public App {
   uint16_t bg() const override { return rgb(8, 8, 12); }
   int idleMs() const override { return 400; }
   int tickMs() const override { return opened ? 20 : 400; }
-  void onLaunch() override { kb.layout(KB_Y, 56, true); info = sys::usbSerialInfo(); }
+  void onLaunch() override { kb.layout(KB_Y, 62, true); kb.setEnter("Send"); info = sys::usbSerialInfo(); }
   void onClose() override { sys::usbSerialClose(); wipePass(); sys::usbPower(false); }
 
   void onTick() override {

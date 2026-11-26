@@ -31,18 +31,23 @@ static void procEntry(void* arg) {
   Process* p = (Process*)arg; setCurrentProcess(p);
   try {
     p->beat = millis(); p->app->onLaunch(); p->beat = millis();
-    Event e;
+    Event e; uint32_t lastTick = millis();
     for (;;) {
-      if (xQueueReceive(p->q, &e, portMAX_DELAY) != pdTRUE) continue;
+      int tm = p->app->tickMs();
+      TickType_t wait = tm > 0 ? (pdMS_TO_TICKS(tm) > 0 ? pdMS_TO_TICKS(tm) : 1) : portMAX_DELAY;
+      BaseType_t got = xQueueReceive(p->q, &e, wait);
       p->beat = millis();
-      if (e.type == 2) break;
-      if (e.type == 0) p->app->onTouch(e.t);
-      else if (e.type == 3) p->app->onCommand(e.cmd);
-      else if (e.type == 1) {
-        int b = 1 - p->frontIdx; p->surf[b]->fillSprite(p->app->bg());
-        p->app->onDraw(*p->surf[b]);
-        p->frontIdx = b; p->hasFrame = true; p->drawPending = false; p->lastDraw = millis(); p->frameSeq++;
+      if (got == pdTRUE) {
+        if (e.type == 2) break;
+        if (e.type == 0) p->app->onTouch(e.t);
+        else if (e.type == 3) p->app->onCommand(e.cmd);
+        else if (e.type == 1) {
+          int bi = 1 - p->frontIdx; p->surf[bi]->fillSprite(p->app->bg());
+          p->app->onDraw(*p->surf[bi]);
+          p->frontIdx = bi; p->hasFrame = true; p->drawPending = false; p->lastDraw = millis(); p->frameSeq++;
+        }
       }
+      if (tm > 0 && millis() - lastTick >= (uint32_t)tm) { p->app->onTick(); lastTick = millis(); }
       p->beat = millis();
     }
     p->app->onClose();
@@ -58,6 +63,8 @@ static void reap(Process* p) {
     for (int i = 0; i < 30 && !p->exited; i++) vTaskDelay(pdMS_TO_TICKS(10));
     if (!p->exited) { kernel::log("force-killing %s (not responding)", p->name.c_str()); vTaskDelete(p->task); }
   }
+  if (!p->system) sys::audioStop();
+  kernelCloseFiles(p);
   delete p->app;
   for (auto c : p->owned) kernelFreeCanvas(c);
   if (p->q) vQueueDelete(p->q);
@@ -77,7 +84,7 @@ static Process* spawnApp(App* app, const char* name, int idx, const char* arg, b
   }
   p->surfBytes = 2 * (size_t)SW * SH * 2;
   p->q = xQueueCreate(32, sizeof(Event)); p->beat = millis();
-  if (xTaskCreate(procEntry, name, app->stackBytes(), p, 2, &p->task) != pdPASS) {
+  if (xTaskCreatePinnedToCore(procEntry, name, app->stackBytes(), p, 3, &p->task, 1) != pdPASS) {
     kernel::fault(kernel::E_OOM, "Cannot start %s: no memory for its task stack.", name); p->exited = true; reap(p); return nullptr;
   }
   kernel::log("spawn %s", name);
@@ -99,6 +106,9 @@ static void launchApp(int idx, const char* arg, bool zoom, int ix, int iy, int s
 }
 static void postTouch(Process* p) {
   if (!p || p->exited || !(tc.down || tc.pressed || tc.released)) return;
+  static int lx = -99, ly = -99;   // a held finger that has not moved generates no events (no pointless redraws)
+  if (!tc.pressed && !tc.released && abs(tc.x - lx) < 2 && abs(tc.y - ly) < 2) return;
+  lx = tc.x; ly = tc.y;
   p->dirty = true;
   Event e{}; e.type = 0; e.t = tc;
   xQueueSend(p->q, &e, (tc.pressed || tc.released) ? 5 : 0);   // never drop press/release
@@ -132,7 +142,7 @@ static void statusBar(M5Canvas& g, bool dark) {
   uint16_t c = dark ? TFT_BLACK : TFT_WHITE;
   g.setTextColor(c); uiFont(&g, &fonts::FreeSansBold12pt7b); uiSize(&g, 1);
   g.setTextDatum(middle_left); g.drawString(sys::timeString().c_str(), 40, 30);
-  int lvl = M5.Power.getBatteryLevel(); if (lvl < 0) lvl = 0; if (lvl > 100) lvl = 100;
+  int lvl = sys::battery(); if (lvl < 0) lvl = 0; if (lvl > 100) lvl = 100;
   int bx = SW - 100, by = 20;
   g.drawRoundRect(bx, by, 52, 24, 7, c); g.fillRect(bx + 53, by + 8, 3, 8, c);
   g.fillRoundRect(bx + 3, by + 3, (46 * lvl) / 100, 18, 4, lvl <= 20 ? TFT_RED : c);

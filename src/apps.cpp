@@ -538,7 +538,7 @@ const AppInfo kApps[] = {
   {"Photos", C565(255,255,255), C565(240,240,245), gPhotos, nullptr},
   {"Camera", C565(205,205,210), C565(125,125,132), gCamera, nullptr},
   {"Safari", C565(255,255,255), C565(235,240,250), gSafari, nullptr},
-  {"Music", C565(255,95,110), C565(235,30,70), gMusic, nullptr},
+  {"Music", C565(255,95,110), C565(235,30,70), gMusic, makeMusic},
   {"Maps", C565(120,225,140), C565(60,185,110), gMaps, nullptr},
   {"Files", C565(255,255,255), C565(235,240,250), gFiles, nullptr},
   {"Console", C565(40, 40, 46), C565(8, 8, 10), gConsole, []() -> App* { return new Console(); }},

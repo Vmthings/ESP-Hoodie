@@ -49,6 +49,8 @@ class App {
   virtual int stackBytes() const { return 24576; }
   virtual int idleMs() const { return 1000; }        // redraw at least this often (kernel skips draws when nothing changed)
   virtual bool animating() const { return false; }    // true while an animation needs every frame
+  virtual int tickMs() const { return 0; }           // >0: onTick() runs about every tickMs (background work such as audio)
+  virtual void onTick() {}
 };
 
 struct AppInfo {
@@ -60,7 +62,8 @@ struct AppInfo {
 extern const AppInfo kApps[];
 extern const int kAppCount;
 extern const int kVisibleCount;                 // apps on the home screen (Console is hidden)
-App* makeSpringboard();                         // the home/lock screen app
+App* makeSpringboard();
+App* makeMusic();                         // the home/lock screen app
 std::string scriptRun(const std::string& src);
 std::string matrixCommand(const std::vector<std::string>& args);   // 'matrix [seconds]' (kernel shell + serial)  // HRScript service, used by the kernel 'run' command
 
@@ -86,6 +89,13 @@ void freeCanvas(M5Canvas* c);
 bool canvasValid(M5Canvas* c);
 bool readFile(const char* path, std::vector<uint8_t>& out);       // only /icons/* and /fonts/*
 void pet();
+// SD card (read-only, .mp3 only) and audio output - the kernel owns the hardware
+bool sdMount(bool force = false);
+std::vector<std::string> listMp3();
+int fileOpen(const char* path); size_t fileRead(int h, uint8_t* buf, size_t n); bool fileSeek(int h, size_t pos);
+size_t fileSize(int h); size_t filePos(int h); void fileClose(int h);
+bool audioAvailable(); bool audioReady(); bool audioBusy();
+bool audioPlay(const int16_t* pcm, size_t samples, uint32_t rate, bool stereo); void audioStop(); void setVolume(int v);
 struct ProcInfo { int pid; std::string user, name, state; uint32_t stackFree, surfKB; };
 struct RuntimeInfo { uint32_t uptimeMs = 0, fps = 0, frameMs = 0, heapFree = 0, heapMin = 0, psramFree = 0, watchdogLimitMs = 5000, fgBeatAgeMs = 0, kills = 0, cpuMHz = 0; std::string fgName, resetReason; };
 std::vector<ProcInfo> procList();                 // snapshot of the process table (all owned by root)

@@ -1,5 +1,7 @@
 // Kernel side of the userspace boundary: system calls + UI font service.
 #include <LittleFS.h>
+#include <SD.h>
+#include <SPI.h>
 #include <esp_heap_caps.h>
 #include <cstdarg>
 #include <mutex>
@@ -19,7 +21,11 @@ namespace sys {
 int displayW() { return M5.Display.width(); }
 int displayH() { return M5.Display.height(); }
 void setBrightness(int v) { M5.Display.setBrightness((uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v)); }
-int battery() { return M5.Power.getBatteryLevel(); }
+int battery() {   // cached: an I2C read per frame was a big source of lag
+  static uint32_t t = 0; static int v = -1;
+  if (v < 0 || millis() - t > 5000) { v = M5.Power.getBatteryLevel(); t = millis(); }
+  return v;
+}
 uint32_t freeHeap() { return ESP.getFreeHeap(); }
 uint32_t freePsram() { return ESP.getFreePsram(); }
 void log(const char* fmt, ...) { char b[256]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap); kernel::log("%s", b); }
@@ -38,8 +44,9 @@ void pet() { if (tl_cur) tl_cur->beat = millis(); }
 std::string timeString(bool sec) {
   char b[16];
   if (M5.Rtc.isEnabled()) {
-    auto t = M5.Rtc.getTime();
-    if (sec) snprintf(b, sizeof b, "%d:%02d:%02d", t.hours, t.minutes, t.seconds); else snprintf(b, sizeof b, "%d:%02d", t.hours, t.minutes);
+    static uint32_t lt = 0; static int h = 0, m = 0, s = 0;   // RTC is read at most twice a second
+    if (millis() - lt >= 500 || lt == 0) { auto t = M5.Rtc.getTime(); h = t.hours; m = t.minutes; s = t.seconds; lt = millis() | 1; }
+    if (sec) snprintf(b, sizeof b, "%d:%02d:%02d", h, m, s); else snprintf(b, sizeof b, "%d:%02d", h, m);
   } else {
     uint32_t s = millis() / 1000 + 9 * 3600 + 41 * 60;
     if (sec) snprintf(b, sizeof b, "%u:%02u:%02u", (s / 3600) % 24, (s / 60) % 60, s % 60); else snprintf(b, sizeof b, "%u:%02u", (s / 3600) % 24, (s / 60) % 60);
@@ -87,6 +94,70 @@ bool readFile(const char* path, std::vector<uint8_t>& out) {
 void kernelFreeCanvas(M5Canvas* c) {
   { std::lock_guard<std::mutex> lk(g_liveMx); g_live.erase(c); }
   delete c;
+}
+
+// ---------- SD card + audio services ----------
+static std::mutex g_sdMx; static bool g_sdOk = false;
+static bool lowerEndsMp3(const std::string& n) {
+  if (n.size() < 4) return false;
+  std::string e = n.substr(n.size() - 4); for (auto& c : e) c = tolower(c);
+  return e == ".mp3";
+}
+static void scanDir(const std::string& dir, int depth, std::vector<std::string>& out) {
+  File d = SD.open(dir.c_str());
+  if (!d || !d.isDirectory()) return;
+  for (File e = d.openNextFile(); e && out.size() < 300; e = d.openNextFile()) {
+    std::string p = e.path(), nm = e.name();
+    if (!nm.empty() && nm[0] == '.') continue;
+    if (e.isDirectory()) { if (depth < 3 && nm != "System Volume Information") scanDir(p, depth + 1, out); }
+    else if (lowerEndsMp3(nm)) out.push_back(p);
+  }
+}
+struct FH { File f; Process* owner = nullptr; bool used = false; };
+static FH g_fh[4];
+namespace sys {
+bool sdMount(bool force) {
+  std::lock_guard<std::mutex> lk(g_sdMx);
+  if (g_sdOk && !force) return true;
+  if (g_sdOk) SD.end();
+  SPI.begin(43, 39, 44, 42);                 // Tab5 microSD (SPI): SCK 43, MISO 39, MOSI 44, CS 42
+  g_sdOk = SD.begin(42, SPI, 20000000);
+  kernel::log("SD card %s", g_sdOk ? "mounted" : "not found");
+  return g_sdOk;
+}
+std::vector<std::string> listMp3() {
+  std::vector<std::string> v; std::lock_guard<std::mutex> lk(g_sdMx);
+  if (g_sdOk) scanDir("/", 0, v);
+  return v;
+}
+int fileOpen(const char* path) {
+  std::string p = path;
+  if (p.empty() || p[0] != '/' || p.find("..") != std::string::npos || !lowerEndsMp3(p)) { kernel::log("fileOpen denied: %s", path); return -1; }
+  std::lock_guard<std::mutex> lk(g_sdMx);
+  if (!g_sdOk) return -1;
+  for (int i = 0; i < 4; i++) if (!g_fh[i].used) {
+    g_fh[i].f = SD.open(p.c_str(), FILE_READ);
+    if (!g_fh[i].f) return -1;
+    g_fh[i].used = true; g_fh[i].owner = tl_cur; return i;
+  }
+  return -1;
+}
+static bool okH(int h) { return h >= 0 && h < 4 && g_fh[h].used && g_fh[h].owner == tl_cur; }
+size_t fileRead(int h, uint8_t* b, size_t n) { std::lock_guard<std::mutex> lk(g_sdMx); return okH(h) ? g_fh[h].f.read(b, n) : 0; }
+bool fileSeek(int h, size_t pos) { std::lock_guard<std::mutex> lk(g_sdMx); return okH(h) && g_fh[h].f.seek(pos); }
+size_t fileSize(int h) { std::lock_guard<std::mutex> lk(g_sdMx); return okH(h) ? g_fh[h].f.size() : 0; }
+size_t filePos(int h) { std::lock_guard<std::mutex> lk(g_sdMx); return okH(h) ? g_fh[h].f.position() : 0; }
+void fileClose(int h) { std::lock_guard<std::mutex> lk(g_sdMx); if (okH(h)) { g_fh[h].f.close(); g_fh[h].used = false; g_fh[h].owner = nullptr; } }
+bool audioAvailable() { return M5.Speaker.isEnabled(); }
+bool audioReady() { return M5.Speaker.isEnabled() && M5.Speaker.isPlaying(0) != 2; }
+bool audioBusy() { return M5.Speaker.isPlaying(0) != 0; }
+bool audioPlay(const int16_t* pcm, size_t n, uint32_t rate, bool stereo) { return M5.Speaker.playRaw(pcm, n, rate, stereo, 1, 0, false); }
+void audioStop() { M5.Speaker.stop(); }
+void setVolume(int v) { M5.Speaker.setVolume((uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v)); }
+}  // namespace sys
+void kernelCloseFiles(Process* p) {
+  std::lock_guard<std::mutex> lk(g_sdMx);
+  for (auto& f : g_fh) if (f.used && f.owner == p) { f.f.close(); f.used = false; f.owner = nullptr; }
 }
 
 // ---------- UI font service ----------

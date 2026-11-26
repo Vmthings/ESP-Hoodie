@@ -22,6 +22,7 @@ struct Process {
 Process* currentProcess();            // thread-local: the process whose task is running
 void setCurrentProcess(Process* p);
 void kernelFreeCanvas(M5Canvas* c);
+void kernelCloseFiles(Process* p);
 void fontInit();
 bool fsMounted();
 void makeSprite(M5Canvas& c, int w, int h, int depth, const char* what);

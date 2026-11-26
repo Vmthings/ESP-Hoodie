@@ -55,3 +55,12 @@ Types: number, string ("..." with \n \t \\ \"), nil. Operators: + - * / % == != 
 Builtins: print(...) rgb(r,g,b) clear(c) rect(x,y,w,h,c) circle(x,y,r,c) line(x1,y1,x2,y2,c) text(x,y,s,size,c) width() height() millis() delay(ms 0-2000)
 rand(n) str(x) num(s) len(s) sqrt(x) sin(x) cos(x) abs(x) floor(x) heap() psram() brightness(0-255) matrix([seconds 0-60]).
 Shell: `matrix [seconds]` too (0 stops). Limits: 400k steps per run, call depth 40, canvas 720x420.
+
+## Music app (SD .mp3)
+Music scans the microSD card (up to 3 folders deep) for .mp3 files, lists them, and plays with prev/play/next, a progress bar and volume.
+Tab5 microSD is read on SPI pins SCK 43, MISO 39, MOSI 44, CS 42. Decoding runs in the app (arduino-libhelix); the kernel provides SD reads and the speaker.
+Audio stops when you leave the app (no background playback yet). Format: FAT32 card, MPEG-1/2 Layer III files.
+
+## Lag fixes (v0.4)
+Compositor on its own core-0 task above app priority; apps pinned to core 1; battery/RTC I2C reads cached (were per frame);
+a held finger that has not moved no longer forces redraws.

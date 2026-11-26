@@ -64,3 +64,10 @@ Audio stops when you leave the app (no background playback yet). Format: FAT32 c
 ## Lag fixes (v0.4)
 Compositor on its own core-0 task above app priority; apps pinned to core 1; battery/RTC I2C reads cached (were per frame);
 a held finger that has not moved no longer forces redraws.
+
+## Raspberry Pi control (Developer Mode)
+Settings > Developer > Raspberry Pi (USB-A) opens a login + terminal for a Pi on the USB-A port (CDC-ACM serial; Developer Mode required).
+Pi setup (gadget serial): add `dtoverlay=dwc2` to config.txt, `modules-load=dwc2,g_serial` to cmdline.txt, run `sudo systemctl enable serial-getty@ttyGS0`.
+Use a data cable from the Tab5 USB-A port to the Pi's USB data port; power the Pi separately. The Tab5 5V output is OFF unless you switch it on in the app.
+The password is only held in RAM until it is sent. A Pi acting as a plain USB host (A-to-A cable) or a USB-UART chip that is not CDC-ACM (FTDI/CP210x) is not supported yet.
+Kernel shell: `usb` shows the USB-A device status.

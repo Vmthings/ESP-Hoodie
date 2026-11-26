@@ -397,9 +397,10 @@ class Settings : public App {
       label(cy, "Developer Mode", nullptr); toggle(cy, devAnim);
       if (rowHit(cy)) sys::setDevMode(!sys::devMode());
       if (sys::devMode()) {
-        cy += RH + 54; group("TOOLS", 5); int y = cy;
+        cy += RH + 54; group("TOOLS", 6); int y = cy;
         label(y, "HRScript Console", ">"); if (rowHit(y)) sys::launch("Console", "script");
         y += RH; label(y, "Kernel Shell", ">"); if (rowHit(y)) sys::launch("Console", "shell");
+        y += RH; label(y, "Raspberry Pi (USB-A)", ">"); if (rowHit(y)) sys::launch("RPi", "");
         y += RH; label(y, "Show FPS", nullptr); toggle(y, fpsAnim); if (rowHit(y)) sys::setShowFps(!sys::showFps());
         y += RH; label(y, "Raise test fault", nullptr, rgb(0, 122, 255)); if (rowHit(y)) sys::raiseFault(0x3001, "Test fault raised from Settings > Developer.");
         y += RH; label(y, "Trigger kernel panic", nullptr, TFT_RED); if (rowHit(y)) sys::requestPanic("Test panic triggered from Settings > Developer.");
@@ -528,6 +529,11 @@ static void gMaps(M5Canvas& c, int x, int y, int) {
 static void gFiles(M5Canvas& c, int, int, int) {
   c.fillRoundRect(22, 34, 38, 18, 6, rgb(20, 130, 255)); c.fillRoundRect(22, 44, 84, 56, 9, rgb(20, 130, 255)); c.fillRoundRect(22, 54, 84, 46, 9, rgb(70, 170, 255)); }
 
+static void gRpi(M5Canvas& c, int, int, int) {
+  c.fillTriangle(64, 40, 40, 14, 56, 46, rgb(70, 200, 90)); c.fillTriangle(64, 40, 88, 14, 72, 46, rgb(70, 200, 90));
+  c.fillCircle(64, 80, 36, TFT_WHITE);
+  for (int i = 0; i < 7; i++) c.fillCircle(46 + (i % 3) * 18, 66 + (i / 3) * 18, 7, rgb(200, 30, 70)); }
+
 const AppInfo kApps[] = {
   // dock (first 4), then home grid; Console is last and hidden from the home screen
   {"Settings", C565(190,190,196), C565(120,120,128), gSettings, []() -> App* { return new Settings(); }},
@@ -542,6 +548,7 @@ const AppInfo kApps[] = {
   {"Maps", C565(120,225,140), C565(60,185,110), gMaps, nullptr},
   {"Files", C565(255,255,255), C565(235,240,250), gFiles, nullptr},
   {"Console", C565(40, 40, 46), C565(8, 8, 10), gConsole, []() -> App* { return new Console(); }},
+  {"RPi", C565(205,35,75), C565(150,20,55), gRpi, makeRpi},
 };
 const int kAppCount = sizeof(kApps) / sizeof(kApps[0]);
-const int kVisibleCount = kAppCount - 1;   // Console: reachable only via Settings > Developer
+const int kVisibleCount = kAppCount - 2;   // Console: reachable only via Settings > Developer

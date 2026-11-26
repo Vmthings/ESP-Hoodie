@@ -63,7 +63,8 @@ extern const AppInfo kApps[];
 extern const int kAppCount;
 extern const int kVisibleCount;                 // apps on the home screen (Console is hidden)
 App* makeSpringboard();
-App* makeMusic();                         // the home/lock screen app
+App* makeMusic();
+App* makeRpi();                         // the home/lock screen app
 std::string scriptRun(const std::string& src);
 std::string matrixCommand(const std::vector<std::string>& args);   // 'matrix [seconds]' (kernel shell + serial)  // HRScript service, used by the kernel 'run' command
 
@@ -94,6 +95,9 @@ bool sdMount(bool force = false);
 std::vector<std::string> listMp3();
 int fileOpen(const char* path); size_t fileRead(int h, uint8_t* buf, size_t n); bool fileSeek(int h, size_t pos);
 size_t fileSize(int h); size_t filePos(int h); void fileClose(int h);
+// USB-A host serial (Developer Mode only; CDC-ACM, e.g. a Raspberry Pi in USB gadget serial mode)
+int usbSerialState(); std::string usbSerialInfo(); bool usbSerialOpen(uint32_t baud);
+size_t usbSerialRead(uint8_t* buf, size_t n); bool usbSerialWrite(const uint8_t* d, size_t n); void usbSerialClose(); void usbPower(bool on);
 bool audioAvailable(); bool audioReady(); bool audioBusy();
 bool audioPlay(const int16_t* pcm, size_t samples, uint32_t rate, bool stereo); void audioStop(); void setVolume(int v);
 struct ProcInfo { int pid; std::string user, name, state; uint32_t stackFree, surfKB; };

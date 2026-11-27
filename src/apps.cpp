@@ -37,9 +37,10 @@ static std::atomic<bool> g_wantGfx{false};
 static std::atomic<int> g_consoleMode{-1};     // -1 = Console not open, 0 = HRScript, 1 = kernel shell
 static bool matrixActive() { uint32_t e = g_matrixEnd.load(); return e > 1 && (int32_t)(e - millis()) > 0; }
 struct Rain { int cols = 0, rows = 0, w = 0, h = 0; std::vector<float> head, speed; std::vector<uint8_t> br; std::vector<char> ch; uint32_t last = 0; };
-static Rain g_rain;
-static void matrixStep(M5Canvas& g, int ox, int oy, int w, int h) {
-  const int CW = 14, CH = 18; Rain& m = g_rain;
+static Rain g_rain[3];   // 0 = canvas / shell area, 1 = SCRIPTS pane, 2 = USERS pane
+static void matrixStep(M5Canvas& g, int ox, int oy, int w, int h, int id, bool fill, uint16_t tint, int bright) {
+  const int CW = 14, CH = 18; Rain& m = g_rain[id];
+  int tr = ((tint >> 11) & 31) * 255 / 31, tg = ((tint >> 5) & 63) * 255 / 63, tb = (tint & 31) * 255 / 31;
   static const char* GL = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ@#$%&*+=<>";
   const int NG = strlen(GL);
   if (m.w != w || m.h != h) {
@@ -56,23 +57,24 @@ static void matrixStep(M5Canvas& g, int ox, int oy, int w, int h) {
       if (r >= 0 && r < m.rows) { m.br[r * m.cols + c] = 255; m.ch[r * m.cols + c] = GL[esp_random() % NG]; }
     if (m.head[c] > m.rows + 24) { m.head[c] = -(float)(esp_random() % 12); m.speed[c] = 8 + esp_random() % 18; }
   }
-  g.fillRect(ox, oy, w, h, TFT_BLACK); g.setClipRect(ox, oy, w, h);
+  int32_t scx, scy, scw, sch; g.getClipRect(&scx, &scy, &scw, &sch);   // keep the caller's clip (panes)
+  if (fill) g.fillRect(ox, oy, w, h, TFT_BLACK);
+  g.setClipRect(ox, oy, w, h);
   uiFont(&g, &fonts::Font2); uiSize(&g, 1); g.setTextDatum(middle_center);
   for (int r = 0; r < m.rows; r++) for (int c = 0; c < m.cols; c++) {
     uint8_t& b = m.br[r * m.cols + c]; if (!b) continue;
-    uint16_t col = b >= 250 ? rgb(210, 255, 220) : rgb(0, b, b / 5);
+    uint16_t col = b >= 250 ? rgb(210 * bright / 100, 255 * bright / 100, 220 * bright / 100) : rgb(tr * b / 255 * bright / 100, tg * b / 255 * bright / 100, tb * b / 255 * bright / 100);
     if (b < 250) { b = b > dec ? b - dec : 0; if (esp_random() % 40 == 0) m.ch[r * m.cols + c] = GL[esp_random() % NG]; }
     char s[2] = {m.ch[r * m.cols + c], 0}; g.setTextColor(col); g.drawString(s, ox + c * CW + CW / 2, oy + r * CH + CH / 2);
     if (b >= 250) b = 249;   // head becomes trail on the next frame
   }
-  g.clearClipRect();
+  g.setClipRect(scx, scy, scw, sch);
 }
 std::string matrixCommand(const std::vector<std::string>& a) {
   double s = a.size() > 1 ? atof(a[1].c_str()) : 10;
   if (s < 0 || s > 60) return "usage: matrix [0-60 seconds]  (0 stops it)";
   if (g_consoleMode.load() < 0) return "open the Console first (Settings > Developer > Console)";
   g_matrixEnd = s == 0 ? 1 : millis() + (uint32_t)(s * 1000);
-  if (g_consoleMode.load() == 0) g_wantGfx = true;
   return s == 0 ? "matrix stopped" : "matrix running...";
 }
 
@@ -112,7 +114,7 @@ struct ScriptHost {
     I.bind("floor", [=](V& a) { need(a, 1, "floor(x)"); return Value::num(floor(num(a, 0))); });
     I.bind("heap", [](V&) { return Value::num(sys::freeHeap()); });
     I.bind("psram", [](V&) { return Value::num(sys::freePsram()); });
-    I.bind("matrix", [=](V& a) { if (a.size() > 1) throw std::invalid_argument("expected matrix([seconds])"); double s = a.empty() ? 10 : num(a, 0); if (s < 0 || s > 60) throw std::out_of_range("matrix seconds must be 0..60"); canvas(); g_matrixEnd = s == 0 ? 1 : millis() + (uint32_t)(s * 1000); g_wantGfx = true; return Value(); });
+    I.bind("matrix", [=](V& a) { if (a.size() > 1) throw std::invalid_argument("expected matrix([seconds])"); double s = a.empty() ? 10 : num(a, 0); if (s < 0 || s > 60) throw std::out_of_range("matrix seconds must be 0..60"); canvas(); g_matrixEnd = s == 0 ? 1 : millis() + (uint32_t)(s * 1000); return Value(); });
     I.bind("brightness", [=](V& a) { need(a, 1, "brightness(0..255)"); double b = num(a, 0); if (b < 0 || b > 255) throw std::out_of_range("brightness must be 0..255"); sys::setBrightness((int)b); return Value(); });
   }
 };
@@ -185,12 +187,17 @@ class Console : public App {
     uiFont(&g, &fonts::Font2); uiSize(&g, 1); g.setTextColor(TFT_BLACK, c); g.setTextDatum(middle_left); g.drawString(title, x + 6, y + 11);
     g.setClipRect(x + 3, y + 24, w - 6, h - 26);
   }
-  void ln(M5Canvas& g, int x, int y, const std::string& s, uint16_t c) { g.setTextColor(c); g.setTextDatum(top_left); g.drawString(s.c_str(), x, y); }
+  void ln(M5Canvas& g, int x, int y, const std::string& s, uint16_t c) {
+    g.setTextDatum(top_left);
+    if (matrixActive()) { g.setTextColor(TFT_BLACK); g.drawString(s.c_str(), x + 1, y + 1); }   // shadow keeps text readable over the rain
+    g.setTextColor(c); g.drawString(s.c_str(), x, y);
+  }
 
   void drawDash(M5Canvas& g) {
     uint16_t th = kThemes[g_themeIdx], dim = rgb(120, 120, 120); const int L = 17;
     // ---- 4: SCRIPTS (top) ----
     pane(g, 6, 102, SW - 12, 220, "SCRIPTS - executed", th);
+    if (matrixActive()) matrixStep(g, 9, 126, SW - 18, 194, 1, false, th, 50);   // matrix rain behind the executed commands
     {
       std::vector<Line> rows;
       for (auto& h : g_hist) {
@@ -232,7 +239,8 @@ class Console : public App {
         ln(g, 10, y, std::to_string(p.pid), th); ln(g, 56, y, u, u == "root" ? rgb(255, 80, 80) : th);
         ln(g, 112, y, clip(p.name, 14), th); ln(g, 250, y, p.state, dim); y += L;
       }
-      if (shown < procs.size()) ln(g, 10, y, "loading...", dim);
+      if (shown < procs.size()) { ln(g, 10, y, "loading...", dim); y += L; }
+      if (matrixActive() && 766 - y > 36) matrixStep(g, 9, y + 2, 344, 766 - y - 2, 2, false, th, 100);   // matrix rain under the root users
     }
     g.clearClipRect();
     // ---- 3: RUNTIME / WATCHDOG (bottom right) ----
@@ -255,7 +263,7 @@ class Console : public App {
 
   void drawPlain(M5Canvas& g) {
     int top = 112, bot = inY;
-    if (mode == 1 && matrixActive()) { matrixStep(g, 0, top, SW, bot - top - 4); return; }
+    if (mode == 1 && matrixActive()) { matrixStep(g, 0, top, SW, bot - top - 4, 0, true, rgb(0, 255, 51), 100); return; }
     if (scr && gfx) { scr->pushSprite(&g, 0, top); top += 428; }
     uiFont(&g, &fonts::Font2); uiSize(&g, 1.3f); g.setTextDatum(top_left);
     int lh = 26, n = (bot - top) / lh, from = (int)g_out.size() > n ? g_out.size() - n : 0;
@@ -281,11 +289,9 @@ class Console : public App {
   void onDraw(M5Canvas& g) override {
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     uint16_t th = kThemes[g_themeIdx];
-    if (g_wantGfx.exchange(false) && mode == 0 && !gfx) { gfx = true; layout(); }
-    if (mode == 0 && scr) {
-      if (matrixActive()) matrixStep(*scr, 0, 0, SW, 420);
-      else if (g_matrixEnd.load()) { g_matrixEnd = 0; scr->fillSprite(TFT_BLACK); }
-    } else if (mode == 1 && !matrixActive() && g_matrixEnd.load()) g_matrixEnd = 0;
+    bool mx = matrixActive();
+    if (mode == 0 && gfx && scr && mx) matrixStep(*scr, 0, 0, SW, 420, 0, true, rgb(0, 255, 51), 100);   // GFX view: canvas
+    if (!mx && g_matrixEnd.load()) { g_matrixEnd = 0; if (scr) scr->fillSprite(TFT_BLACK); }
     uiFont(&g, &fonts::FreeSansBold12pt7b); uiSize(&g, 1); g.setTextDatum(middle_left); g.setTextColor(mode ? (uint16_t)TFT_WHITE : th);
     g.drawString(mode ? "Kernel shell" : "HRScript", 24, 80);
     for (auto& b : btns) { g.drawRoundRect(b.x, 62, b.w, 36, 6, th); uiFont(&g, &fonts::Font2); uiSize(&g, 1); g.setTextColor(th); g.setTextDatum(middle_center); g.drawString(b.label, b.x + b.w / 2, 80); }

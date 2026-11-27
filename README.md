@@ -71,3 +71,7 @@ Pi setup (gadget serial): add `dtoverlay=dwc2` to config.txt, `modules-load=dwc2
 Use a data cable from the Tab5 USB-A port to the Pi's USB data port; power the Pi separately. The Tab5 5V output is OFF unless you switch it on in the app.
 The password is only held in RAM until it is sent. A Pi acting as a plain USB host (A-to-A cable) or a USB-UART chip that is not CDC-ACM (FTDI/CP210x) is not supported yet.
 Kernel shell: `usb` shows the USB-A device status.
+
+## matrix in the dashboard
+`matrix` now rains inside the SCRIPTS pane (behind the executed commands) and under the root users in the USERS pane, tinted with the dashboard colour.
+In the GFX view it still fills the script canvas, and in the kernel shell it fills the output area.
